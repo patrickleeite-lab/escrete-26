@@ -218,7 +218,7 @@ input[type=range]{width:100%;accent-color:var(--verde)}
 .clube-card .cab{display:flex;align-items:center;gap:10px}
 .clube-card .n{font-family:var(--display);font-size:22px;line-height:1}
 .clube-card .e{font-size:11px;color:var(--txt3)}
-.clube-card .linha{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;color:var(--txt3);letter-spacing:.06em;text-transform:uppercase}
+.clube-card .linha{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;color:var(--txt3);letter-spacing:.05em;text-transform:uppercase}
 .clube-card .linha b{font-family:var(--display);font-size:22px;color:var(--txt);letter-spacing:.02em}
 .clube-card .linha b.v{color:var(--verde)}
 .voltar{position:absolute;left:20px;top:20px}
@@ -1554,8 +1554,26 @@ const COPA_FASES = ['Primeira Fase', 'Segunda Fase', 'Terceira Fase', 'Quarta Fa
 
 let temporada = null;
 
-const J = id => temporada.jogadores[id];
-const C = id => temporada.clubes[id];
+// Clubes/jogadores "especiais" (estrangeiros, da Intercontinental e do Mundial de Clubes) não
+// vivem em temporada.clubes/jogadores — são times de fora do jogo, montados na hora a partir do
+// MERCADO_EXTERNO e guardados só dentro de temporada.icc/temporada.cmc (ids negativos).
+function clubesEspeciaisAtivos() {
+  const out = [];
+  if (temporada.icc && temporada.icc.adversarios) out.push(...temporada.icc.adversarios);
+  if (temporada.cmc && temporada.cmc.especiais) out.push(...Object.values(temporada.cmc.especiais));
+  return out;
+}
+const J = id => {
+  if (id >= 0) return temporada.jogadores[id];
+  for (const c of clubesEspeciaisAtivos()) { const j = c.jogadores.find(x => x.id === id); if (j) return j; }
+  return undefined;
+};
+const C = id => {
+  if (id >= 0) return temporada.clubes[id];
+  if (temporada.icc && temporada.icc.adversarios) { const a = temporada.icc.adversarios.find(x => x.id === id); if (a) return a; }
+  if (temporada.cmc && temporada.cmc.especiais && temporada.cmc.especiais[id]) return temporada.cmc.especiais[id];
+  return undefined;
+};
 const meuClube = () => C(temporada.clubeId);
 const partidaDe = id => temporada.partidas[id];
 
@@ -1813,7 +1831,11 @@ function validarEscalacao(c) {
   const ids = c.titulares.filter(x => x != null);
   if (new Set(ids).size !== ids.length) avisos.unshift({ tipo: 'dup', texto: 'Jogador repetido na escalação.' });
   const grave = avisos.some(a => ['vazio', 'lesao', 'suspenso', 'gol', 'dup'].includes(a.tipo));
-  return { avisos, grave, forca: forcaTime(t) };
+  // ataque/defesa exibidos já com o efeito da postura (retranca reduz ataque e reforça defesa, etc.)
+  // — sem isso, trocar a postura na tela de Escalação não mudava nenhum número visível
+  const f = forcaTime(t);
+  const po = POSTURAS[c.postura] || POSTURAS.equilibrado;
+  return { avisos, grave, forca: { ...f, atk: f.atk * po.atk, def: f.def * po.def } };
 }
 
 // Garante 11 válidos antes de jogar. Devolve lista de ajustes feitos.
@@ -2073,8 +2095,328 @@ function meuConfrontoLib() {
 }
 const estouNaLib = () => temporada.lib.participantes.includes(temporada.clubeId) && temporada.lib.eliminadoEm[temporada.clubeId] == null;
 
+// ---------- Copa Intercontinental e Mundial de Clubes ----------
+// As duas só existem pro seu clube: acontecem no fim da temporada, só se você tiver sido
+// campeão da Libertadores. Os adversários são clubes reais sorteados do MERCADO_EXTERNO — dados
+// reais de elenco (Real Madrid, Man City, Bayern...), montados na hora com os 11 melhores na
+// posição certa, igual qualquer time da IA. Não são times jogáveis fora disso: não entram em
+// temporada.clubes, não jogam liga nem envelhecem — só existem pra esse confronto/torneio.
+const LIGAS_ICC = ['Premier League', 'LALIGA EA SPORTS', 'Bundesliga', "Ligue 1 McDonald's", 'Serie A Enilive'];
+const LIGAS_RESTO_MUNDO = ['MLS', 'Liga Portugal', 'Eredivisie', 'EFL Championship', 'LALIGA HYPERMOTION'];
+let _clubesEstrangeirosCache = null;
+function clubesEstrangeiros() {
+  if (_clubesEstrangeirosCache) return _clubesEstrangeirosCache;
+  const porClube = {};
+  MERCADO_EXTERNO.forEach(e => { (porClube[e.clube] ??= []).push(e); });
+  const out = [];
+  for (const [nome, jogadores] of Object.entries(porClube)) {
+    if (jogadores.length < 16 || !jogadores.some(j => j.pos === 'GOL')) continue;
+    out.push({ nome, pais: jogadores[0].pais, liga: jogadores[0].liga, jogadores, forca: Math.round(soma(jogadores.map(j => j.ovr)) / jogadores.length) });
+  }
+  _clubesEstrangeirosCache = out;
+  return out;
+}
+// sorteia um clube forte dentro das ligas dadas — mais forte pesa mais, mas não é garantido
+function sortearClubeEstrangeiro(ligas, excluirNomes = []) {
+  const pool = clubesEstrangeiros().filter(c => ligas.includes(c.liga) && !excluirNomes.includes(c.nome));
+  return pool.length ? escolherPeso(pool, c => Math.pow(1.15, c.forca - 70)) : null;
+}
+function corDeNome(nome) {
+  const paletas = [['#1B1F3B', '#D9A441'], ['#7A0C0C', '#F2F4F1'], ['#0B3D0B', '#F2F4F1'], ['#0A2A5C', '#FFFFFF'], ['#5C0A0A', '#FFFFFF'], ['#101010', '#E8323C'], ['#2B1B5C', '#FFFFFF'], ['#004225', '#FFFFFF']];
+  return paletas[hashStr(nome) % paletas.length];
+}
+// Monta o "clube" jogável (elenco, titulares, banco) a partir do sorteio — id negativo, sem
+// colidir com clubes/filler de verdade. Guardado direto no save (icc/cmc), não é recalculado.
+function montarClubeEspecial(base, id) {
+  const jogadores = base.jogadores.map((e, i) => ({ id: id * 100 - i, nome: e.nome, idade: e.idade, pos: e.pos, ovr: e.ovr, pot: e.pot, attr: e.attr, car: e.car || [], alt: e.alt || [], clube: id }));
+  const slots = slotsDe('4-3-3');
+  const vagas = atribuicaoOtima(jogadores, slots.map(s => s.pos), (j, pos) => rendPos(j, pos));
+  const titulares = vagas.map(j => (j ? j.id : null));
+  const usados = new Set(titulares.filter(x => x != null));
+  const banco = jogadores.filter(j => !usados.has(j.id)).sort((a, b) => b.ovr - a.ovr).map(j => j.id).slice(0, 9);
+  return { id, nome: base.nome, sigla: siglaDe(base.nome), cores: corDeNome(base.nome), estadio: 'Sede definida pela confederação', pais: base.pais, liga: base.liga, elenco: jogadores.map(j => j.id), jogadores, titulares, banco, formacao: '4-3-3', postura: 'equilibrado' };
+}
+// Contexto pro motor: real (id>=0, joga liga/Libertadores) ou especial (estrangeiro, id<0).
+function contextoQualquer(id) { return id < 0 ? contextoEspecialDe(id) : contextoDe(id); }
+function contextoEspecialDe(id) {
+  const c = C(id);
+  return { clube: { id: c.id, nome: c.nome, sigla: c.sigla, cores: c.cores, estadio: c.estadio }, titulares: titularesCtx(c), banco: c.banco.map(J), postura: c.postura, formacao: c.formacao, ia: true };
+}
+// Resolve um confronto automaticamente (mata-mata não empata: pênaltis se precisar) — usado pra
+// fases do Mundial de Clubes em que o seu time não está envolvido.
+function resolverMataMataAutomatico(a, b) {
+  const ctxA = contextoQualquer(a), ctxB = contextoQualquer(b);
+  const r = simularRapido(ctxA, ctxB, { comp: 'CMC', mando: false });
+  let vencedor, pen = null;
+  if (r.gc === r.gf) { const p = simularPenaltis(ctxA, ctxB); pen = [p.a, p.b]; vencedor = p.a > p.b ? a : b; }
+  else vencedor = r.gc > r.gf ? a : b;
+  return { a, b, vencedor, golsA: r.gc, golsB: r.gf, pen };
+}
+// ---------- Copa Intercontinental: Derby das Américas → Challenger Cup → Final (regulamento
+// real desde 2024) — o campeão da Libertadores joga 3 jogos até erguer a taça, com o campeão
+// europeu entrando só na final.
+const ICC_FASES = ['Derby das Américas', 'Challenger Cup', 'Final'];
+function iccCompromisso() {
+  const icc = temporada.icc;
+  const adv = icc.adversarios[icc.faseAtual];
+  const partida = { casa: temporada.clubeId, fora: adv.id, comp: 'ICC', neutro: true, jogado: false, gc: 0, gf: 0 };
+  return { tipo: 'ICC', fase: ICC_FASES[icc.faseAtual], partida, souCasa: true, adversario: adv.id };
+}
+
+// ---------- Mundial de Clubes: 32 times, fase de grupos (8 grupos de 4, todos-contra-todos) +
+// mata-mata (oitavas, quartas, semi, final) — formato real desde 2025. Acontece de 4 em 4 anos.
+// Só entra quem foi campeão da Libertadores daquele ciclo; os outros 31 times são preenchidos com
+// clubes reais (5 sul-americanos fortes da própria base do jogo + 12 europeus + 14 do resto do
+// mundo, sorteados do MERCADO_EXTERNO). Os jogos que não envolvem seu clube — os outros 7 grupos
+// inteiros, o outro jogo de cada rodada do seu grupo, e o resto do chaveamento quando você é
+// eliminado — são resolvidos na hora (mesma lógica de força/pênaltis do motor), sem precisar
+// encaixar 96+ partidas no calendário: a Copa do Mundo de Clubes "para" as ligas por um mês, então
+// tudo isso acontece de uma vez, fora da rodada normal.
+const GRUPOS_LETRAS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+// todos-contra-todos de 4 times (índices 0-3 dentro do grupo) em 3 rodadas
+const RR4 = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
+const ORDEM_FASES = ['grupos', 'oitavas', 'quartas', 'semi', 'final'];
+const FASES_MATA_MATA_NOME = { oitavas: 'Oitavas de Final', quartas: 'Quartas de Final', semi: 'Semifinal', final: 'Final' };
+const novaEstatGrupo = () => ({ pts: 0, v: 0, e: 0, d: 0, gp: 0, gc: 0, j: 0 });
+function resolverJogoGrupoAutomatico(a, b) {
+  const r = simularRapido(contextoQualquer(a), contextoQualquer(b), { comp: 'CMC', mando: false });
+  return { golsA: r.gc, golsB: r.gf };
+}
+function aplicarResultadoGrupo(cmc, a, b, golsA, golsB) {
+  const ta = cmc.tabela[a], tb = cmc.tabela[b];
+  ta.j++; tb.j++; ta.gp += golsA; ta.gc += golsB; tb.gp += golsB; tb.gc += golsA;
+  if (golsA > golsB) { ta.v++; ta.pts += 3; tb.d++; }
+  else if (golsA < golsB) { tb.v++; tb.pts += 3; ta.d++; }
+  else { ta.e++; tb.e++; ta.pts++; tb.pts++; }
+}
+function classificacaoGrupo(cmc, grupo) {
+  return grupo.slice().sort((x, y) => {
+    const a = cmc.tabela[x], b = cmc.tabela[y];
+    return (b.pts - a.pts) || ((b.gp - b.gc) - (a.gp - a.gc)) || (b.gp - a.gp);
+  });
+}
+// pareia consecutivos: [times[0] x times[1], times[2] x times[3], ...]
+function novaRodadaMataMata(times) {
+  const out = [];
+  for (let i = 0; i < times.length; i += 2) out.push({ a: times[i], b: times[i + 1], vencedor: null, golsA: null, golsB: null, pen: null });
+  return out;
+}
+// Cria a próxima rodada de mata-mata e já resolve todo mundo, MENOS o confronto do seu clube
+// (que fica pendente pra você jogar).
+function avancarUmaRodadaMataMata(cmc, proxFase, times) {
+  const confrontos = novaRodadaMataMata(times);
+  for (const conf of confrontos) {
+    if (conf.a === temporada.clubeId || conf.b === temporada.clubeId) continue;
+    const r = resolverMataMataAutomatico(conf.a, conf.b);
+    Object.assign(conf, { vencedor: r.vencedor, golsA: r.golsA, golsB: r.golsB, pen: r.pen });
+  }
+  cmc.mataMata[proxFase] = confrontos;
+  cmc.fase = proxFase;
+}
+// Resolve o torneio inteiro sozinho, sem você (foi eliminado na fase indicada) — usado pra saber
+// quem é o campeão mesmo depois que sua participação acabou.
+function avancarAutomaticamenteAteFinal(cmc, faseAtual, vencedores) {
+  for (let idx = ORDEM_FASES.indexOf(faseAtual) + 1; idx < ORDEM_FASES.length; idx++) {
+    const fase = ORDEM_FASES[idx];
+    const confrontos = novaRodadaMataMata(vencedores);
+    for (const conf of confrontos) { const r = resolverMataMataAutomatico(conf.a, conf.b); Object.assign(conf, { vencedor: r.vencedor, golsA: r.golsA, golsB: r.golsB, pen: r.pen }); }
+    cmc.mataMata[fase] = confrontos;
+    vencedores = confrontos.map(c => c.vencedor);
+  }
+  cmc.campeao = vencedores[0]; cmc.fase = 'concluido';
+  noticia(temporada.rodada, `${C(cmc.campeao).nome} é o campeão do Mundial de Clubes ${temporada.ano}.`);
+}
+function criarMundialDeClubes(meu) {
+  // 6 vagas CONMEBOL: você + os 5 clubes sul-americanos mais fortes do jogo (BR1/AR1)
+  const conmebol = [meu, ...temporada.clubes.filter(c => (c.liga === 'BR1' || c.liga === 'AR1') && c.id !== meu).sort((x, y) => forcaDinamica(y) - forcaDinamica(x)).slice(0, 5).map(c => c.id)];
+  const usados = new Set();
+  const sortearN = (ligas, n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) { const base = sortearClubeEstrangeiro(ligas, [...usados]); if (!base) break; usados.add(base.nome); out.push(base); }
+    return out;
+  };
+  let nextId = -9001;
+  const especiais = {};
+  const idsDe = bases => bases.map(b => { const c = montarClubeEspecial(b, nextId--); especiais[c.id] = c; return c.id; });
+  const uefaIds = idsDe(sortearN(LIGAS_ICC, 12)); // 12 vagas UEFA
+  const restoIds = idsDe(sortearN(LIGAS_RESTO_MUNDO, 14)); // 14 vagas do resto do mundo
+
+  const todos = embaralhar([...conmebol, ...uefaIds, ...restoIds]);
+  const grupos = [];
+  for (let i = 0; i < 8; i++) grupos.push(todos.slice(i * 4, i * 4 + 4));
+  const meuGrupo = grupos.findIndex(g => g.includes(meu));
+  const tabela = {};
+  todos.forEach(id => { tabela[id] = novaEstatGrupo(); });
+
+  const cmc = { especiais, grupos, meuGrupo, tabela, rodadaGrupo: 0, fase: 'grupos', mataMata: { oitavas: null, quartas: null, semi: null, final: null }, campeao: null, eliminadoNaFaseDeGrupos: false };
+  temporada.cmc = cmc;
+
+  // resolve de uma vez os 3 jogos de cada um dos outros 7 grupos
+  grupos.forEach((g, gi) => {
+    if (gi === meuGrupo) return;
+    for (const rodada of RR4) for (const [i, j] of rodada) { const { golsA, golsB } = resolverJogoGrupoAutomatico(g[i], g[j]); aplicarResultadoGrupo(cmc, g[i], g[j], golsA, golsB); }
+  });
+  const rivaisDoGrupo = grupos[meuGrupo].filter(id => id !== meu).map(id => C(id).nome).join(', ');
+  noticia(0, `Mundial de Clubes ${temporada.ano}: sorteio define os grupos. ${meuClube().nome} caiu no Grupo ${GRUPOS_LETRAS[meuGrupo]}, com ${rivaisDoGrupo}.`);
+}
+function finalizarFaseDeGrupos(cmc) {
+  const meu = temporada.clubeId;
+  const classificacoes = cmc.grupos.map(g => classificacaoGrupo(cmc, g));
+  const minha = classificacoes[cmc.meuGrupo];
+  const meuPos = minha.indexOf(meu);
+  noticia(temporada.rodada, `Mundial de Clubes: fim da fase de grupos no Grupo ${GRUPOS_LETRAS[cmc.meuGrupo]} — ${minha.map((id, i) => `${i + 1}º ${C(id).nome}`).join(', ')}.`);
+  const primeiros = classificacoes.map(c => c[0]), segundos = classificacoes.map(c => c[1]);
+  // chaveamento oficial das oitavas: A1-B2, C1-D2, E1-F2, G1-H2, B1-A2, D1-C2, F1-E2, H1-G2
+  const timesR16 = [primeiros[0], segundos[1], primeiros[2], segundos[3], primeiros[4], segundos[5], primeiros[6], segundos[7], primeiros[1], segundos[0], primeiros[3], segundos[2], primeiros[5], segundos[4], primeiros[7], segundos[6]];
+  if (meuPos > 1) {
+    cmc.eliminadoNaFaseDeGrupos = true;
+    creditar(meu, 'premiacao', 1);
+    noticia(temporada.rodada, `${meuClube().nome} eliminado na fase de grupos do Mundial de Clubes (${meuPos + 1}º no Grupo ${GRUPOS_LETRAS[cmc.meuGrupo]}).`);
+    avancarAutomaticamenteAteFinal(cmc, 'grupos', timesR16);
+    return;
+  }
+  creditar(meu, 'premiacao', 2);
+  noticia(temporada.rodada, `${meuClube().nome} classificado às oitavas de final do Mundial de Clubes!`);
+  avancarUmaRodadaMataMata(cmc, 'oitavas', timesR16);
+}
+// Gancho chamado ao fim da temporada (fase='fim'): só monta as competições se você foi campeão
+// continental — são raras e giram em torno do seu clube, por isso não existem pra ninguém mais.
+function prepararCompeticoesEspeciais() {
+  const meu = temporada.clubeId;
+  const lib = temporada.lib;
+  temporada.icc = null; temporada.cmc = null;
+  if (lib.campeao !== meu) return;
+  const advDerby = sortearClubeEstrangeiro(LIGAS_RESTO_MUNDO);
+  const advChallenger = sortearClubeEstrangeiro(LIGAS_RESTO_MUNDO, advDerby ? [advDerby.nome] : []);
+  const advFinalICC = sortearClubeEstrangeiro(LIGAS_ICC);
+  if (advDerby && advChallenger && advFinalICC) {
+    // ids -8001..-8003: faixa própria, separada da do Mundial de Clubes (-9001 pra baixo) pra
+    // nunca colidir quando as duas competições existem na mesma temporada (ano de ciclo).
+    temporada.icc = { faseAtual: 0, adversarios: [montarClubeEspecial(advDerby, -8001), montarClubeEspecial(advChallenger, -8002), montarClubeEspecial(advFinalICC, -8003)], resultados: [null, null, null], jogado: false, campeao: null };
+  }
+  if (temporada.ano % 4 === 1) criarMundialDeClubes(meu);
+}
+function cmcCompromisso() {
+  const cmc = temporada.cmc;
+  const meu = temporada.clubeId;
+  if (cmc.fase === 'grupos') {
+    const g = cmc.grupos[cmc.meuGrupo];
+    const meuIdxNoGrupo = g.indexOf(meu);
+    const par = RR4[cmc.rodadaGrupo].find(([i, j]) => i === meuIdxNoGrupo || j === meuIdxNoGrupo);
+    const fora = g[par[0] === meuIdxNoGrupo ? par[1] : par[0]];
+    return { tipo: 'CMC', fase: `Fase de Grupos · Grupo ${GRUPOS_LETRAS[cmc.meuGrupo]} · Rodada ${cmc.rodadaGrupo + 1}/3`, partida: { casa: meu, fora, comp: 'CMC', neutro: true, jogado: false, gc: 0, gf: 0 }, souCasa: true, adversario: fora };
+  }
+  if (cmc.fase === 'concluido') return null;
+  const confrontos = cmc.mataMata[cmc.fase];
+  const meuConf = confrontos.find(c => c.a === meu || c.b === meu);
+  if (!meuConf) return null;
+  const fora = meuConf.a === meu ? meuConf.b : meuConf.a;
+  return { tipo: 'CMC', fase: FASES_MATA_MATA_NOME[cmc.fase], partida: { casa: meu, fora, comp: 'CMC', neutro: true, jogado: false, gc: 0, gf: 0 }, souCasa: true, adversario: fora };
+}
+// Efeitos pós-jogo só no SEU lado (fisico/moral/cartões/lesões) — o adversário estrangeiro é
+// efêmero, não precisa (nem pode: não faz parte de temporada.jogadores) persistir nada.
+function aplicarPosJogoAmistoso(res, meuLado) {
+  const c = meuClube();
+  const mins = res.minutos[meuLado];
+  const jogaram = new Set(Object.keys(mins).map(Number));
+  const meus = meuLado === 'casa' ? res.gc : res.gf, deles = meuLado === 'casa' ? res.gf : res.gc;
+  const venceu = meus > deles, perdeu = meus < deles;
+  const postura = res.posturas[meuLado];
+  const desgaste = postura === 'pressao' ? 27 : postura === 'ofensivo' ? 23 : 21;
+  for (const id of c.elenco) {
+    const j = J(id);
+    if (jogaram.has(id)) {
+      const m = mins[id];
+      j.jogos++; j.banco = 0; j.minutos = (j.minutos || 0) + m; j.carreiraJogos = (j.carreiraJogos || 0) + 1;
+      const folego = temCaracteristica(j, 'Incansável') ? CARACTERISTICAS['Incansável'].desgaste : 1;
+      j.fisico = clamp(Math.round(j.fisico - desgaste * folego * (m / 90) - rnd(0, 3)), 5, 100);
+      if (m >= 30) { if (venceu && chance(0.55)) j.moral = clamp(j.moral + 1, 1, 5); if (perdeu && chance(0.4)) j.moral = clamp(j.moral - 1, 1, 5); }
+    } else { if (j.suspenso > 0) j.suspenso--; if (j.lesao > 0) j.lesao--; }
+  }
+  for (const g of res.gols) { if (g.clube === c.id) { const j = J(g.j); j.gols++; j.carreiraGols = (j.carreiraGols || 0) + 1; } }
+  for (const a of res.amarelos) { if (a.clube !== c.id) continue; const j = J(a.j); if (res.vermelhos.some(v => v.j === a.j && !v.direto)) continue; j.amarelos++; if (j.amarelos >= 3) { j.amarelos = 0; j.suspenso = 1; } }
+  for (const v of res.vermelhos) { if (v.clube !== c.id) continue; J(v.j).suspenso = v.direto ? 2 : 1; }
+  for (const l of res.lesoes) { if (l.clube !== c.id) continue; const j = J(l.j); j.lesao = l.jogos; noticia(temporada.rodada, `${nomeCurto(j.nome)} se lesionou e fica ${l.jogos} jogo${l.jogos > 1 ? 's' : ''} fora.`); }
+}
+// Chamado quando a partida narrada da Intercontinental/Mundial termina (em vez de concluirCompromisso).
+function concluirConfrontoEspecial(cp, res) {
+  const meu = temporada.clubeId;
+  aplicarPosJogoAmistoso(res, 'casa');
+  const meuGols = res.gc, advGols = res.gf;
+  const faseDeGrupos = cp.tipo === 'CMC' && temporada.cmc.fase === 'grupos';
+  let venceu = meuGols > advGols, pen = null;
+  // fase de grupos aceita empate de verdade; mata-mata (Intercontinental inteira, ou o resto do
+  // Mundial) não empata — decide nos pênaltis, igual Libertadores e Copa do Brasil.
+  if (!faseDeGrupos && meuGols === advGols) {
+    const r = simularPenaltis(contextoDe(meu), contextoQualquer(cp.adversario));
+    pen = [r.a, r.b]; venceu = r.a > r.b;
+    res.pen = pen; // pro post-jogo (posJogoHTML) mostrar a decisão nos pênaltis
+  }
+  const adv = C(cp.adversario).nome;
+  if (cp.tipo === 'ICC') {
+    const icc = temporada.icc;
+    icc.resultados[icc.faseAtual] = { golsMeu: meuGols, golsAdv: advGols, pen, venceu };
+    const premios = [1, 2.5, 8];
+    if (!venceu) {
+      icc.jogado = true; icc.campeao = false;
+      creditar(meu, 'premiacao', icc.faseAtual === 2 ? 3 : 0.4);
+      if (icc.faseAtual === 2) noticia(temporada.rodada, `Vice-campeão intercontinental: ${meuClube().nome} perde a final para o ${adv}${pen ? ' nos pênaltis' : ` por ${advGols} a ${meuGols}`}.`);
+      else noticia(temporada.rodada, `${meuClube().nome} eliminado n${icc.faseAtual === 0 ? 'o Derby das Américas' : 'a Challenger Cup'} da Copa Intercontinental pelo ${adv}${pen ? ' nos pênaltis' : ''}.`);
+    } else if (icc.faseAtual === 2) {
+      icc.jogado = true; icc.campeao = true;
+      creditar(meu, 'premiacao', premios[2]);
+      noticia(temporada.rodada, `CAMPEÃO INTERCONTINENTAL! ${meuClube().nome} vence o ${adv}${pen ? ` nos pênaltis (${pen[0]}-${pen[1]})` : ` por ${meuGols} a ${advGols}`} na final e conquista o título.`);
+    } else {
+      creditar(meu, 'premiacao', premios[icc.faseAtual]);
+      noticia(temporada.rodada, `${meuClube().nome} avança na Copa Intercontinental: venceu ${icc.faseAtual === 0 ? 'o Derby das Américas' : 'a Challenger Cup'} contra o ${adv}${pen ? ' nos pênaltis' : ` por ${meuGols} a ${advGols}`}.`);
+      icc.faseAtual++;
+    }
+  } else if (faseDeGrupos) {
+    const cmc = temporada.cmc;
+    aplicarResultadoGrupo(cmc, meu, cp.adversario, meuGols, advGols);
+    const g = cmc.grupos[cmc.meuGrupo];
+    const meuIdxNoGrupo = g.indexOf(meu);
+    const outroPar = RR4[cmc.rodadaGrupo].find(([i, j]) => i !== meuIdxNoGrupo && j !== meuIdxNoGrupo);
+    const outro = resolverJogoGrupoAutomatico(g[outroPar[0]], g[outroPar[1]]);
+    aplicarResultadoGrupo(cmc, g[outroPar[0]], g[outroPar[1]], outro.golsA, outro.golsB);
+    noticia(temporada.rodada, `Mundial de Clubes · Grupo ${GRUPOS_LETRAS[cmc.meuGrupo]}: ${meuClube().nome} ${meuGols} x ${advGols} ${adv} · ${C(g[outroPar[0]]).nome} ${outro.golsA} x ${outro.golsB} ${C(g[outroPar[1]]).nome}.`);
+    cmc.rodadaGrupo++;
+    if (cmc.rodadaGrupo >= 3) finalizarFaseDeGrupos(cmc);
+  } else {
+    const cmc = temporada.cmc;
+    const faseAtual = cmc.fase;
+    const confrontos = cmc.mataMata[faseAtual];
+    const meuConf = confrontos.find(c => c.a === meu || c.b === meu);
+    Object.assign(meuConf, { vencedor: venceu ? meu : cp.adversario, golsA: meuGols, golsB: advGols, pen });
+    if (!venceu && faseAtual === 'final') {
+      cmc.campeao = cp.adversario; cmc.fase = 'concluido';
+      creditar(meu, 'premiacao', 6);
+      noticia(temporada.rodada, `Vice-campeão mundial: ${meuClube().nome} perde a final do Mundial de Clubes para o ${adv}${pen ? ' nos pênaltis' : ` por ${advGols} a ${meuGols}`}.`);
+    } else if (!venceu) {
+      creditar(meu, 'premiacao', 1);
+      noticia(temporada.rodada, `${meuClube().nome} eliminado n${faseAtual === 'semi' ? 'a semifinal' : 'as ' + FASES_MATA_MATA_NOME[faseAtual].toLowerCase()} do Mundial de Clubes pelo ${adv}${pen ? ' nos pênaltis' : ''}.`);
+      avancarAutomaticamenteAteFinal(cmc, faseAtual, confrontos.map(c => c.vencedor));
+    } else if (faseAtual === 'final') {
+      cmc.campeao = meu; cmc.fase = 'concluido';
+      creditar(meu, 'premiacao', 15);
+      noticia(temporada.rodada, `CAMPEÃO MUNDIAL DE CLUBES! ${meuClube().nome} conquista o título de ${temporada.ano} batendo o ${adv}${pen ? ' nos pênaltis' : ` por ${meuGols} a ${advGols}`}.`);
+    } else {
+      creditar(meu, 'premiacao', 4);
+      const proxFase = ORDEM_FASES[ORDEM_FASES.indexOf(faseAtual) + 1];
+      noticia(temporada.rodada, `${meuClube().nome} avança! Bateu o ${adv}${pen ? ' nos pênaltis' : ` por ${meuGols} a ${advGols}`} e está n${proxFase === 'final' ? 'a final' : 'as ' + FASES_MATA_MATA_NOME[proxFase].toLowerCase()} do Mundial de Clubes.`);
+      avancarUmaRodadaMataMata(cmc, proxFase, confrontos.map(c => c.vencedor));
+    }
+  }
+  salvar();
+  return { tipo: cp.tipo, especial: true };
+}
+
 // ---------- próximo compromisso ----------
+// Mundial de Clubes primeiro (calendário real: junho/julho), Intercontinental depois (dezembro)
+// — nos anos de ciclo, o mesmo clube disputa as duas, nessa ordem.
 function proximoCompromisso() {
+  if (temporada.cmc && temporada.cmc.fase !== 'concluido') { const r = cmcCompromisso(); if (r) return r; }
+  if (temporada.icc && !temporada.icc.jogado) return iccCompromisso();
   if (temporada.fase === 'fim' || temporada.fase === 'demitido') return { tipo: 'FIM' };
   const lib = temporada.lib;
   if (lib.pendente) {
@@ -2099,7 +2441,14 @@ function creditar(clubeId, campo, valor) {
   c.caixa += valor;
   if (clubeId === temporada.clubeId) temporada.financas.atual[campo] += valor;
 }
-function debitar(clubeId, campo, valor) { creditar(clubeId, campo, -valor); }
+// Tira do caixa, mas guarda a categoria (compras/outros) como valor POSITIVO — igual folha e
+// manutenção já são guardados — pra bater com todo o resto do cálculo/exibição de finanças.
+// (era isso que fazia "Compras de jogadores" aparecer com "+" e cor de receita na tela)
+function debitar(clubeId, campo, valor) {
+  const c = C(clubeId);
+  c.caixa -= valor;
+  if (clubeId === temporada.clubeId) temporada.financas.atual[campo] += valor;
+}
 
 function aplicarPosJogo(p, res) {
   p.gc = res.gc; p.gf = res.gf; p.jogado = true; p.gols = res.gols; p.pen = res.pen || p.pen || null;
@@ -2161,11 +2510,11 @@ function simularEAplicar(p) {
 // ---------- fluxo de rodada ----------
 function iniciarCompromisso() {
   const cp = proximoCompromisso();
-  if (cp.tipo !== 'LIGA' && cp.tipo !== 'LIB') return { cp, sim: null, ajustes: [] };
+  if (!['LIGA', 'LIB', 'ICC', 'CMC'].includes(cp.tipo)) return { cp, sim: null, ajustes: [] };
   const c = meuClube();
   const ajustes = sanearEscalacao(c);
   const p = cp.partida;
-  const casa = contextoDe(p.casa), fora = contextoDe(p.fora);
+  const casa = contextoQualquer(p.casa), fora = contextoQualquer(p.fora);
   const sim = criarPartida(casa, fora, { comp: p.comp, mando: !p.neutro, ladoEu: cp.souCasa ? 'casa' : 'fora' });
   return { cp, sim, ajustes, casa, fora };
 }
@@ -2230,7 +2579,7 @@ function finalizarRodadaOuSlot(cp) {
     if (LIB_APOS.includes(r) && temporada.lib.slot <= 6) temporada.lib.pendente = true;
     if (COPA_APOS.includes(r) && temporada.copa && !temporada.copa.finalizada) avancarCopa();
     if (rodadaEconomia(r) === 'demitido') { resumo.fim = true; resumo.demitido = true; }
-    else if (temporada.rodada > RODADAS) { temporada.fase = 'fim'; resumo.fim = true; encerrarTemporada(); }
+    else if (temporada.rodada > RODADAS) { temporada.fase = 'fim'; encerrarTemporada(); prepararCompeticoesEspeciais(); resumo.fim = !temporada.icc && !temporada.cmc; }
   }
   salvar();
   return resumo;
@@ -2580,13 +2929,15 @@ function tabela(liga) {
 }
 function posicaoNaTabela(clubeId) { return tabela(C(clubeId).liga).find(l => l.clube === clubeId); }
 
+// Clube exibido é o de quando o gol foi feito (mais recente), não o atual — senão um artilheiro
+// vendido pro exterior no meio da temporada aparece com o escudo errado na lista.
 function artilharia(comp, limite = 15) {
   const m = {};
   for (const p of temporada.partidas) {
     if (!p.jogado || p.comp !== comp) continue;
-    for (const g of p.gols) m[g.j] = (m[g.j] || 0) + 1;
+    for (const g of p.gols) { if (!m[g.j]) m[g.j] = { gols: 0, clube: g.clube }; m[g.j].gols++; m[g.j].clube = g.clube; }
   }
-  return Object.entries(m).map(([id, g]) => ({ j: J(+id), gols: g })).sort((a, b) => b.gols - a.gols || b.j.ovr - a.j.ovr).slice(0, limite);
+  return Object.entries(m).map(([id, x]) => ({ j: J(+id), gols: x.gols, clube: x.clube })).sort((a, b) => b.gols - a.gols || b.j.ovr - a.j.ovr).slice(0, limite);
 }
 
 // ---------- notícias ----------
@@ -2600,7 +2951,7 @@ function gerarNoticias(r, resultados) {
     noticia(r, `${v.nome} atropela o ${d.nome}: ${Math.max(goleada.gc, goleada.gf)} a ${Math.min(goleada.gc, goleada.gf)}.`);
   }
   const art = artilharia(pais, 1)[0];
-  if (art && r > 2) noticia(r, `${nomeCurto(art.j.nome)} (${C(art.j.clube).nome}) lidera a artilharia com ${art.gols} gol${art.gols > 1 ? 's' : ''}.`);
+  if (art && r > 2) noticia(r, `${nomeCurto(art.j.nome)} (${C(art.clube).nome}) lidera a artilharia com ${art.gols} gol${art.gols > 1 ? 's' : ''}.`);
   noticia(r, `${lider.nome} ${r === 1 ? 'larga na frente' : 'segue na ponta'} com ${tab[0].pts} pontos após ${r} rodada${r > 1 ? 's' : ''}.`);
   const minha = tab.find(l => l.clube === temporada.clubeId);
   if (minha.pos >= 17 && r >= 6) noticia(r, `Alerta: ${meuClube().nome} está na zona de rebaixamento (${minha.pos}º).`);
@@ -2638,7 +2989,7 @@ function resumoTemporada() {
   const saldoDe = p => (p.casa === c.id ? p.gc - p.gf : p.gf - p.gc);
   const melhor = meus.slice().sort((a, b) => saldoDe(b) - saldoDe(a))[0];
   const pior = meus.slice().sort((a, b) => saldoDe(a) - saldoDe(b))[0];
-  const art = artilharia(c.liga, 40).filter(a => a.j.clube === c.id)[0];
+  const art = artilharia(c.liga, 40).filter(a => a.clube === c.id)[0];
   const artGeral = artilharia(c.liga, 1)[0];
   const lib = temporada.lib;
   return {
@@ -2824,8 +3175,9 @@ function mercadoIA(rodada) {
 
 // Propostas da IA pelos SEUS jogadores: você decide aceitar ou recusar.
 function gerarPropostasRecebidas(rodada) {
-  if (!janelaAberta() || !chance(0.5)) return;
+  // limpa vencidas sempre, mesmo com a janela fechada — senão elas nunca somem da tela
   temporada.propostas = (temporada.propostas || []).filter(p => p.validaAte >= rodada && J(p.jogador).clube === temporada.clubeId);
+  if (!janelaAberta() || !chance(0.5)) return;
   if (temporada.propostas.length >= 2) return;
   const eu = meuClube();
   const alvos = eu.elenco.map(J).filter(j => !temporada.propostas.some(p => p.jogador === j.id)).sort((a, b) => b.valor - a.valor).slice(0, 8);
@@ -2848,8 +3200,9 @@ function gerarPropostasRecebidas(rodada) {
 // (reserva descartável) ou que precisa vender porque está no vermelho — sempre abaixo do valor
 // de mercado. Você decide comprar ou ignorar, sem pressa (a oferta dura algumas rodadas).
 function gerarOfertasVenda(rodada) {
-  if (!janelaAberta() || !chance(0.3)) return;
+  // limpa vencidas sempre, mesmo com a janela fechada — senão elas nunca somem da tela
   temporada.ofertasVenda = (temporada.ofertasVenda || []).filter(o => o.validaAte >= rodada && J(o.jogador).clube === o.clube);
+  if (!janelaAberta() || !chance(0.3)) return;
   if (temporada.ofertasVenda.length >= 2) return;
   const eu = meuClube();
   for (const c of embaralhar(temporada.clubes.filter(x => x.id !== eu.id))) {
@@ -3397,7 +3750,7 @@ function topo() {
       <div class="kpi"><div class="v">${pos.pts}</div><div class="l">Pontos</div></div>
       <div class="kpi"><div class="v ${c.caixa < 0 ? 'ambar' : ''}" data-conta="${c.caixa}" data-k="caixa" data-fmt="mi">${fmtMi(c.caixa)}</div><div class="l">Caixa</div></div>
     </div>
-    <div class="topo-acoes">${UI.tela === 'partida' ? '' : `<button class="btn p" data-acao="jogar" ${cp.tipo === 'FIM' ? 'data-fim="1"' : ''}>${icone('play')} ${rotulo}</button>`}</div>
+    <div class="topo-acoes">${UI.tela === 'partida' ? '' : `<button class="btn icone" data-acao="nova" title="Começar nova carreira" aria-label="Começar nova carreira">↺</button><button class="btn p" data-acao="jogar" ${cp.tipo === 'FIM' ? 'data-fim="1"' : ''}>${icone('play')} ${rotulo}</button>`}</div>
   </div></header>`;
 }
 function nav() {
@@ -3450,7 +3803,7 @@ function telaAbertura() {
     corpo = `<button class="btn voltar" data-acao="pais" data-pais="">${icone('voltar')} Países</button>
       <h1 class="d" style="font-size:clamp(48px,8vw,90px)">${UI.pais === 'BR' ? 'Brasil' : 'Argentina'}: <em>quem</em> você vai comandar?</h1>
       <p class="sub">A força é a média dos 11 melhores. O orçamento é o que você tem pra gastar no mercado. Pegar um grande é fácil; subir com um pequeno e um dia levá-lo à Libertadores é história pra contar.</p>
-      ${ligas.map(l => { const cl = todos.filter(d => d.liga === l).sort((a, b) => b.forca - a.forca); return `<h2 class="d" style="font-size:30px;margin-top:34px;align-self:flex-start;width:100%;max-width:1200px;text-align:left">${LIGA_CURTA[l]} <span class="mute2" style="font-size:16px;font-family:var(--texto);letter-spacing:.08em">${cl.length} clubes</span></h2><div class="clubes-grid" style="margin-top:12px">${cl.map(card).join('')}</div>`; }).join('')}`;
+      ${ligas.map(l => { const cl = todos.filter(d => d.liga === l).sort((a, b) => b.forca - a.forca); return `<h2 class="d" style="font-size:30px;margin-top:34px;align-self:flex-start;width:100%;max-width:1200px;text-align:left">${LIGA_CURTA[l]} <span class="mute2" style="font-size:13px;font-family:var(--texto);letter-spacing:.08em">${cl.length} clubes</span></h2><div class="clubes-grid" style="margin-top:12px">${cl.map(card).join('')}</div>`; }).join('')}`;
   }
   return `<div class="abertura">${corpo}</div>`;
 }
@@ -3467,14 +3820,18 @@ function telaCentral() {
   const noticias = temporada.noticias.slice(0, 8);
 
   let prox;
-  if (cp.tipo === 'LIGA' || cp.tipo === 'LIB') {
+  if (cp.tipo === 'LIGA' || cp.tipo === 'LIB' || cp.tipo === 'ICC' || cp.tipo === 'CMC') {
     const casa = C(cp.partida.casa), fora = C(cp.partida.fora);
+    const meta = cp.tipo === 'LIB' ? `<b>Libertadores</b> · ${cp.fase}${cp.fase !== 'Final' ? ` · jogo de ${cp.perna === 0 ? 'ida' : 'volta'}` : ' · jogo único'}`
+      : cp.tipo === 'ICC' ? `<b>Copa Intercontinental</b> · ${cp.fase}`
+      : cp.tipo === 'CMC' ? `<b>Mundial de Clubes ${temporada.ano}</b> · ${cp.fase}`
+      : `<b>${LIGA_NOME[c.liga]}</b> · Rodada ${cp.rodada}`;
     prox = `<div class="prox-jogo">
       <div class="lado">${escudoSVG(casa, 64)}<div class="n">${h(casa.nome)}</div><div class="f">${cp.partida.neutro ? 'Campo neutro' : 'Mandante'} · força ${forcaAtualDe(casa)}</div></div>
       <div class="x">VS</div>
       <div class="lado">${escudoSVG(fora, 64)}<div class="n">${h(fora.nome)}</div><div class="f">${cp.partida.neutro ? 'Campo neutro' : 'Visitante'} · força ${forcaAtualDe(fora)}</div></div>
     </div>
-    <div class="prox-meta"><span>${cp.tipo === 'LIB' ? `<b>Libertadores</b> · ${cp.fase}${cp.fase !== 'Final' ? ` · jogo de ${cp.perna === 0 ? 'ida' : 'volta'}` : ' · jogo único'}` : `<b>${LIGA_NOME[c.liga]}</b> · Rodada ${cp.rodada}`}</span><span>${icone('casa')} <b>${h(cp.partida.neutro ? 'Estádio neutro' : casa.estadio)}</b></span></div>
+    <div class="prox-meta"><span>${meta}</span><span>${icone('casa')} <b>${h(cp.partida.neutro ? 'Estádio neutro' : casa.estadio)}</b></span></div>
     <div style="padding:0 14px 16px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn p g" data-acao="jogar">${icone('play')} Jogar partida</button><button class="btn g" data-acao="ir" data-tela="escalacao">Ver escalação</button></div>`;
   } else if (cp.tipo === 'LIB_SIM') {
     prox = `<div class="vazio" style="padding:26px 14px"><div class="eyebrow">Libertadores · ${cp.fase}</div><p style="margin:10px 0 16px;color:var(--txt2)">Rodada continental sem o ${h(c.nome)}. Os outros clubes jogam agora.</p><button class="btn p" data-acao="jogar">${icone('play')} Simular rodada da Libertadores</button></div>`;
@@ -3485,10 +3842,11 @@ function telaCentral() {
   return `${tituloTela('Central')}
   <div class="grid g-central">
     <div class="grid" style="align-content:start">
-      ${painel(cp.tipo === 'LIB' ? 'Próximo jogo · Libertadores' : 'Próximo jogo', prox)}
+      ${painel(cp.tipo === 'LIB' ? 'Próximo jogo · Libertadores' : cp.tipo === 'ICC' ? 'Próximo jogo · Copa Intercontinental' : cp.tipo === 'CMC' ? 'Próximo jogo · Mundial de Clubes' : 'Próximo jogo', prox)}
       ${propostasHTML()}
       ${ofertasVendaHTML()}
       ${painel('Manchetes', noticias.length ? `<ul class="manchetes">${noticias.map(n => `<li><span class="r">${n.rodada ? `R${n.rodada}` : '—'}</span><span>${h(n.texto)}</span></li>`).join('')}</ul>` : '<div class="vazio">Sem notícias ainda.</div>')}
+      ${painel('Alertas do elenco', alertas.length ? `<div class="alertas">${alertas.slice(0, 6).map(a => `<div class="alerta">${icone('alerta')}<span>${h(a.texto)}</span></div>`).join('')}${alertas.length > 6 ? `<div class="alerta"><span></span><button class="btn s" data-acao="ir" data-tela="elenco">Ver os ${alertas.length - 6} restantes no elenco</button></div>` : ''}</div>` : `<div class="alertas"><div class="alerta ok">${icone('ok')}<span>Elenco inteiro à disposição.</span></div></div>`, alertas.length ? `<span class="tag a">${alertas.length}</span>` : '')}
     </div>
     <div class="grid" style="align-content:start">
       <section class="painel"><div class="kpis">
@@ -3498,7 +3856,6 @@ function telaCentral() {
       </div></section>
       ${diretoriaHTML()}
       ${painel('Classificação', tabelaHTML(fatia, c.id, true), `<button class="btn s" data-acao="ir" data-tela="competicoes">Completa</button>`)}
-      ${painel('Alertas do elenco', alertas.length ? `<div class="alertas">${alertas.slice(0, 6).map(a => `<div class="alerta">${icone('alerta')}<span>${h(a.texto)}</span></div>`).join('')}${alertas.length > 6 ? `<div class="alerta"><span></span><button class="btn s" data-acao="ir" data-tela="elenco">Ver os ${alertas.length - 6} restantes no elenco</button></div>` : ''}</div>` : `<div class="alertas"><div class="alerta ok">${icone('ok')}<span>Elenco inteiro à disposição.</span></div></div>`, alertas.length ? `<span class="tag a">${alertas.length}</span>` : '')}
     </div>
   </div>`;
 }
@@ -3850,7 +4207,7 @@ function telaCompeticoes() {
   if (aba === 'LIB') corpo = chaveHTML();
   else if (aba === 'COPA') corpo = copaHTML();
   else if (aba === 'ART') {
-    const lista = (comp) => { const a = artilharia(comp, 10); return a.length ? `<div class="tabela-wrap"><table class="tabela"><thead><tr><th>#</th><th>Jogador</th><th>Clube</th><th class="c">Gols</th></tr></thead><tbody>${a.map((x, i) => `<tr class="stagger ${x.j.clube === c.id ? 'eu' : ''}" style="--i:${i}"><td class="num mute">${i + 1}</td><td><span class="nome">${h(x.j.nome)}</span></td><td>${escudoNome(C(x.j.clube), 18)}</td><td class="c num verde" style="font-size:20px">${x.gols}</td></tr>`).join('')}</tbody></table></div>` : '<div class="vazio">Ainda sem gols.</div>'; };
+    const lista = (comp) => { const a = artilharia(comp, 10); return a.length ? `<div class="tabela-wrap"><table class="tabela"><thead><tr><th>#</th><th>Jogador</th><th>Clube</th><th class="c">Gols</th></tr></thead><tbody>${a.map((x, i) => `<tr class="stagger ${x.clube === c.id ? 'eu' : ''}" style="--i:${i}"><td class="num mute">${i + 1}</td><td><span class="nome">${h(x.j.nome)}</span></td><td>${escudoNome(C(x.clube), 18)}</td><td class="c num verde" style="font-size:20px">${x.gols}</td></tr>`).join('')}</tbody></table></div>` : '<div class="vazio">Ainda sem gols.</div>'; };
     corpo = `<div class="grid g2" style="padding:14px">${[...ligas, 'LIB'].map(l => painel(l === 'LIB' ? 'Libertadores' : LIGA_NOME[l], lista(l))).join('')}</div>`;
   } else {
     const tab = tabela(aba);
@@ -3929,7 +4286,10 @@ function telaPartida() {
   if (!P) return telaCentral();
   const { cp, sim } = P;
   const casa = C(cp.partida.casa), fora = C(cp.partida.fora);
-  const compTxt = cp.tipo === 'LIB' ? `Libertadores · ${cp.fase}${cp.fase !== 'Final' ? ` · ${cp.perna === 0 ? 'ida' : 'volta'}` : ''}` : `${LIGA_NOME[casa.liga]} · Rodada ${cp.rodada}`;
+  const compTxt = cp.tipo === 'LIB' ? `Libertadores · ${cp.fase}${cp.fase !== 'Final' ? ` · ${cp.perna === 0 ? 'ida' : 'volta'}` : ''}`
+    : cp.tipo === 'ICC' ? `Copa Intercontinental · ${cp.fase}`
+    : cp.tipo === 'CMC' ? `Mundial de Clubes · ${cp.fase}`
+    : `${LIGA_NOME[casa.liga]} · Rodada ${cp.rodada}`;
   const meuLado = P.ladoEu;
   const L = sim.lados[meuLado];
   return `<div class="grid g-partida">
@@ -4079,7 +4439,7 @@ function partidaTerminou() {
   clearTimeout(P.timer);
   const res = P.sim.resultado();
   P.res = res;
-  P.resumo = concluirCompromisso(P.cp, res);
+  P.resumo = (P.cp.tipo === 'ICC' || P.cp.tipo === 'CMC') ? concluirConfrontoEspecial(P.cp, res) : concluirCompromisso(P.cp, res);
   const rel = $('#relogio'); if (rel) { rel.textContent = 'Fim'; rel.classList.add('fim'); }
   $('#controles').innerHTML = controlesHTML();
   const ec = $('#em-campo'); if (ec) ec.innerHTML = emCampoHTML();
@@ -4115,6 +4475,7 @@ function partidaContinuar() {
   const P = UI.partida;
   const resumo = P.resumo;
   UI.partida = null;
+  if (resumo.especial) { ir('central'); return; } // Intercontinental/Mundial: o pós-jogo já contou tudo
   if (resumo.fim) { ir('fim'); return; }
   ir('central');
   modalRodada(resumo);
@@ -4132,7 +4493,7 @@ function modalRodada(resumo) {
   if (resumo.mesFechado) {
     const m = resumo.mesFechado;
     const res = m.receita - m.despesa - (m.outros || 0);
-    corpo += `<div class="resposta ${res < 0 ? 'nao' : 'ok'}" style="margin-top:14px"><b>Fechamento do mês ${m.mes}: ${fmtMi(res, true)}</b><br>Receita ${fmtMi(m.receita)} (TV ${fmtMi(m.tv)}, bilheteria ${fmtMi(m.bilheteria)}, premiação ${fmtMi(m.premiacao)}${m.vendas ? `, vendas ${fmtMi(m.vendas)}` : ''}) · Despesa ${fmtMi(m.despesa + (m.outros || 0))} (folha ${fmtMi(m.folha)}, manutenção ${fmtMi(m.manutencao)}${m.compras ? `, compras ${fmtMi(m.compras)}` : ''}). Caixa: ${fmtMi(m.saldoFim)}.${m.vendaForcada ? `<br><b class="ambar">Venda forçada: ${h(m.vendaForcada.jogador)} por ${fmtMi(m.vendaForcada.valor)}.</b>` : ''}</div>`;
+    corpo += `<div class="resposta ${res < 0 ? 'nao' : 'ok'}" style="margin-top:14px"><b>Fechamento do mês ${m.mes}: ${fmtMi(res, true)}</b><br>Receita ${fmtMi(m.receita)} (TV ${fmtMi(m.tv)}, patrocínio ${fmtMi(m.patrocinio || 0)}, bilheteria ${fmtMi(m.bilheteria)}, premiação ${fmtMi(m.premiacao)}${m.vendas ? `, vendas ${fmtMi(m.vendas)}` : ''}) · Despesa ${fmtMi(m.despesa + (m.outros || 0))} (folha ${fmtMi(m.folha)}, manutenção ${fmtMi(m.manutencao)}${m.compras ? `, compras ${fmtMi(m.compras)}` : ''}). Caixa: ${fmtMi(m.saldoFim)}.${m.vendaForcada ? `<br><b class="ambar">Venda forçada: ${h(m.vendaForcada.jogador)} por ${fmtMi(m.vendaForcada.valor)}.</b>` : ''}</div>`;
   }
   const cp = proximoCompromisso();
   if (cp.tipo === 'LIB') corpo += `<div class="resposta" style="margin-top:14px"><b>Libertadores na sequência</b><br>${cp.fase}${cp.fase !== 'Final' ? ` · jogo de ${cp.perna === 0 ? 'ida' : 'volta'}` : ' · jogo único'} contra o ${h(C(cp.adversario).nome)}.</div>`;
@@ -4159,7 +4520,7 @@ function telaFim() {
   return `<div class="fim-hero"><div class="l">Temporada ${temporada.ano} · ${h(c.nome)}${temporada.temporadaN > 1 ? ` · ${temporada.temporadaN}ª no cargo` : ''}</div><h1 class="d ${!demitido && (campeao || (r.libCampeao && r.libCampeao.id === c.id)) ? 'v' : demitido ? 'ambar' : ''}">${titulo}</h1><p>${h(sub)}</p></div>
   <div class="grid g3">
     <section class="painel"><div class="kpis" style="grid-template-columns:repeat(3,1fr)"><div><div class="v" data-conta="${r.v}">${r.v}</div><div class="l">Vitórias</div></div><div><div class="v" data-conta="${r.e}">${r.e}</div><div class="l">Empates</div></div><div><div class="v" data-conta="${r.d}">${r.d}</div><div class="l">Derrotas</div></div><div><div class="v" data-conta="${r.gp}">${r.gp}</div><div class="l">Gols pró</div></div><div><div class="v" data-conta="${r.gc}">${r.gc}</div><div class="l">Gols contra</div></div><div><div class="v" data-conta="${r.pontos}">${r.pontos}</div><div class="l">Pontos</div></div></div></section>
-    ${painel('Melhores momentos', `<ul class="momentos"><li><span class="r">${ICO.estrela}</span><span>Melhor resultado: <b>${h(jogo(r.melhor))}</b></span></li><li><span class="r">${ICO.alerta}</span><span>Pior resultado: <b>${h(jogo(r.pior))}</b></span></li><li><span class="r">${ICO.bola}</span><span>Seu artilheiro: <b>${r.artilheiro ? `${h(nomeCurto(r.artilheiro.j.nome))}, ${r.artilheiro.gols} gols` : '—'}</b></span></li><li><span class="r">${ICO.bola}</span><span>Artilheiro da liga: <b>${r.artilheiroGeral ? `${h(nomeCurto(r.artilheiroGeral.j.nome))} (${h(C(r.artilheiroGeral.j.clube).nome)}), ${r.artilheiroGeral.gols} gols` : '—'}</b></span></li><li><span class="r">${ICO.estrela}</span><span>Libertadores: <b>${h(r.libEu)}</b>${r.libCampeao ? ` · campeão: ${h(r.libCampeao.nome)}` : ''}</span></li></ul>`)}
+    ${painel('Melhores momentos', `<ul class="momentos"><li><span class="r">${ICO.estrela}</span><span>Melhor resultado: <b>${h(jogo(r.melhor))}</b></span></li><li><span class="r">${ICO.alerta}</span><span>Pior resultado: <b>${h(jogo(r.pior))}</b></span></li><li><span class="r">${ICO.bola}</span><span>Seu artilheiro: <b>${r.artilheiro ? `${h(nomeCurto(r.artilheiro.j.nome))}, ${r.artilheiro.gols} gols` : '—'}</b></span></li><li><span class="r">${ICO.bola}</span><span>Artilheiro da liga: <b>${r.artilheiroGeral ? `${h(nomeCurto(r.artilheiroGeral.j.nome))} (${h(C(r.artilheiroGeral.clube).nome)}), ${r.artilheiroGeral.gols} gols` : '—'}</b></span></li><li><span class="r">${ICO.estrela}</span><span>Libertadores: <b>${h(r.libEu)}</b>${r.libCampeao ? ` · campeão: ${h(r.libCampeao.nome)}` : ''}</span></li></ul>`)}
     ${painel('Caixa e mercado', `<ul class="lista-simples"><li><span>Orçamento inicial</span><span class="num">${fmtMi(r.orcamentoInicial)}</span></li><li><span>Caixa final</span><span class="num ${r.caixa < 0 ? 'ambar' : 'verde'}">${fmtMi(r.caixa)}</span></li>${r.transferencias.map(t => `<li><span class="mute">${t.tipo === 'compra' ? 'Contratou' : 'Vendeu'} ${h(nomeCurto(t.jogador))}</span><span class="num ${t.tipo === 'compra' ? 'ambar' : 'verde'}">${fmtMi(t.valor)}</span></li>`).join('') || '<li><span class="mute">Nenhuma transferência</span><span></span></li>'}</ul>`)}
   </div>
   <div style="display:flex;gap:10px;justify-content:center;margin-top:26px;flex-wrap:wrap">${demitido ? `<button class="btn p g" data-acao="nova">${icone('play')} Nova carreira</button>` : `<button class="btn p g" data-acao="virar">${icone('seta')} Virar a temporada</button>`}<button class="btn g" data-acao="ir" data-tela="competicoes">Ver tabelas finais</button>${demitido ? '' : `<button class="btn g" data-acao="nova">Nova carreira</button>`}</div>`;
